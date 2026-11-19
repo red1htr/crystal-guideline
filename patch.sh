@@ -1,411 +1,545 @@
+
 #!/usr/bin/env bash
-# ═══════════════════════════════════════════════════════════════
-# patch.sh — Crystal Official  |  Modded APK Builder
-# Usage:  ./patch.sh <game.apk>
-#
-# Termux dependencies (run once):
-#   pkg install apktool openjdk-17 zipalign apksigner python3
-#   pkg install aapt  # optional, for manifest inspection
-#
-# Output:  dist/crystal_patched_signed.apk  (ready to install)
-# ═══════════════════════════════════════════════════════════════
+# Crystal Guideline — APK Patch Builder
+# Usage: ./patch.sh <game.apk>
 
-set -euo pipefail
+set -Eeuo pipefail
 
-# ─── colour helpers ───────────────────────────────────────────
-RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'
-BLU='\033[0;34m'; CYN='\033[0;36m'; RST='\033[0m'
+RED='\033[0;31m'
+GRN='\033[0;32m'
+YLW='\033[1;33m'
+BLU='\033[0;34m'
+CYN='\033[0;36m'
+RST='\033[0m'
+
 ok()   { echo -e "${GRN}[✓]${RST} $*"; }
 info() { echo -e "${BLU}[i]${RST} $*"; }
 warn() { echo -e "${YLW}[!]${RST} $*"; }
 die()  { echo -e "${RED}[✗]${RST} $*" >&2; exit 1; }
 
-BANNER=$(cat <<'EOF'
+trap 'die "Patch failed at line $LINENO. Check the error above."' ERR
+
+echo -e "${CYN}
   ██████╗██████╗ ██╗   ██╗███████╗████████╗ █████╗ ██╗
  ██╔════╝██╔══██╗╚██╗ ██╔╝██╔════╝╚══██╔══╝██╔══██╗██║
  ██║     ██████╔╝ ╚████╔╝ ███████╗   ██║   ███████║██║
  ██║     ██╔══██╗  ╚██╔╝  ╚════██║   ██║   ██╔══██║██║
  ╚██████╗██║  ██║   ██║   ███████║   ██║   ██║  ██║███████╗
   ╚═════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝
-           Official Mod Builder v2.0  |  arm64-v8a
-EOF
-)
-echo -e "${CYN}${BANNER}${RST}"
+           Crystal Guideline — ARM64 Builder
+${RST}"
 
-# ─── argument ─────────────────────────────────────────────────
+# ─── Paths ────────────────────────────────────────────────────
+
 APK_IN="${1:-}"
 [[ -z "$APK_IN" ]] && die "Usage: ./patch.sh <game.apk>"
 [[ ! -f "$APK_IN" ]] && die "APK not found: $APK_IN"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORK_DIR="$SCRIPT_DIR/dist/work"
+DIST_DIR="$SCRIPT_DIR/dist"
+WORK_DIR="$DIST_DIR/work"
 DECOMPILED="$WORK_DIR/decompiled"
-SO_SRC="$SCRIPT_DIR/dist/libcrystal_guideline.so"          # compiled by build.sh
-SMALI_SRC="$SCRIPT_DIR/smali/com"
+
+SO_SRC="$DIST_DIR/libcrystal_guideline.so"
+SMALI_SRC="$SCRIPT_DIR/smali/com/crystal"
+
 KEYSTORE="$SCRIPT_DIR/keystore/crystal.jks"
 APK_UNSIGNED="$WORK_DIR/crystal_unsigned.apk"
 APK_ALIGNED="$WORK_DIR/crystal_aligned.apk"
-APK_OUT="$SCRIPT_DIR/dist/crystal_patched_signed.apk"
-
-# ─── dependency check ─────────────────────────────────────────
-info "Checking dependencies…"
-for cmd in apktool java zipalign apksigner python3; do
-    command -v "$cmd" >/dev/null 2>&1 \
-        || die "Missing: $cmd  →  pkg install ${cmd} (or brew install ${cmd})"
-done
-ok "All dependencies found"
-
-# ─── compiled .so check ───────────────────────────────────────
-if [[ ! -f "$SO_SRC" ]]; then
-    warn "libcrystal_guideline.so not found at $SO_SRC"
-    warn "Run ./build.sh first to compile the native library."
-    die  "Missing .so — can't continue"
-fi
-ok "libcrystal_guideline.so found ($(du -sh "$SO_SRC" | cut -f1))"
-
-# ─── clean workspace ──────────────────────────────────────────
-rm -rf "$WORK_DIR"
-mkdir -p "$WORK_DIR" "$SCRIPT_DIR/dist"
-
-# ═══════════════════════════════════════════════════════════════
-# STEP 1: DECOMPILE
-# ═══════════════════════════════════════════════════════════════
-info "Step 1/7 — Decompiling APK with apktool…"
-apktool d "$APK_IN" -o "$DECOMPILED" --no-res 2>/dev/null \
-    || apktool d "$APK_IN" -o "$DECOMPILED" \
-    || die "apktool failed to decompile"
-ok "Decompiled to $DECOMPILED"
-
-# ═══════════════════════════════════════════════════════════════
-# STEP 2: FIND APPLICATION CLASS + INJECT loadLibrary
-# ═══════════════════════════════════════════════════════════════
-info "Step 2/7 — Finding Application class…"
+APK_OUT="$DIST_DIR/crystal_patched_signed.apk"
 
 MANIFEST="$DECOMPILED/AndroidManifest.xml"
-[[ ! -f "$MANIFEST" ]] && die "AndroidManifest.xml not found after decompile"
 
-# Parse android:name on <application> tag
-APP_CLASS=$(python3 - <<'PYEOF'
-import re, sys
+# ─── Dependencies ─────────────────────────────────────────────
 
-with open(sys.argv[1]) as f:
-    content = f.read()
+info "Checking dependencies..."
 
-# Match android:name inside <application ... > block
-m = re.search(r'<application[^>]+android:name="([^"]+)"', content)
-if m:
-    cls = m.group(1)
-    # Handle relative class names (.MyApp → com.mobile.legends.MyApp)
-    if cls.startswith('.'):
-        pkg_m = re.search(r'package="([^"]+)"', content)
-        if pkg_m:
-            cls = pkg_m.group(1) + cls
-    print(cls)
-else:
-    print("NOT_FOUND")
-PYEOF
-"$MANIFEST")
+for cmd in apktool java keytool zipalign apksigner python3; do
+    command -v "$cmd" >/dev/null 2>&1 \
+        || die "Missing dependency: $cmd"
+done
 
-if [[ "$APP_CLASS" == "NOT_FOUND" || -z "$APP_CLASS" ]]; then
-    warn "No custom Application class found — will inject into launcher Activity"
-    INJECT_TARGET="ACTIVITY"
-else
-    ok "Application class: $APP_CLASS"
-    INJECT_TARGET="APPLICATION"
+ok "Dependencies found"
+
+# ─── Check required files ─────────────────────────────────────
+
+[[ -f "$SO_SRC" ]] \
+    || die "Missing native library: $SO_SRC"
+
+[[ -d "$SMALI_SRC" ]] \
+    || die "Missing Crystal Smali directory: $SMALI_SRC"
+
+find "$SMALI_SRC" -type f -name '*.smali' -print -quit | grep -q . \
+    || die "No Smali files found in $SMALI_SRC"
+
+ok "Native library found: $(du -sh "$SO_SRC" | cut -f1)"
+ok "Crystal Smali files found"
+
+# ─── Clean workspace ──────────────────────────────────────────
+
+rm -rf "$WORK_DIR"
+mkdir -p "$WORK_DIR" "$DIST_DIR"
+
+# ═══════════════════════════════════════════════════════════════
+# STEP 1 — DECOMPILE
+# ═══════════════════════════════════════════════════════════════
+
+info "Step 1/7 — Decompiling APK..."
+
+if ! apktool d "$APK_IN" -o "$DECOMPILED" --no-res; then
+    warn "First decompile attempt failed; retrying normally..."
+    rm -rf "$DECOMPILED"
+    apktool d "$APK_IN" -o "$DECOMPILED"
 fi
 
-# Convert class name to smali path  (com.mobile.legends.App → com/mobile/legends/App)
-to_smali_path() {
-    echo "${1//./\/}.smali"
-}
+[[ -f "$MANIFEST" ]] || die "AndroidManifest.xml not found"
 
-# Search for the smali file across all smali dirs (multidex support)
-find_smali_file() {
-    local target_path="$1"
-    for dir in "$DECOMPILED"/smali*/; do
-        local f="$dir/$target_path"
-        if [[ -f "$f" ]]; then
-            echo "$f"
-            return 0
-        fi
-    done
-    return 1
-}
+ok "APK decompiled successfully"
 
-if [[ "$INJECT_TARGET" == "APPLICATION" ]]; then
-    SMALI_REL=$(to_smali_path "$APP_CLASS")
-    TARGET_SMALI=$(find_smali_file "$SMALI_REL") \
-        || die "Smali file not found for $APP_CLASS (path: $SMALI_REL)"
-    ok "Target smali: $TARGET_SMALI"
-else
-    # Find launcher activity from manifest
-    LAUNCHER_ACT=$(python3 - <<'PYEOF'
-import re, sys
+# ═══════════════════════════════════════════════════════════════
+# STEP 2 — FIND CLASS AND INJECT LIBRARY
+# ═══════════════════════════════════════════════════════════════
 
-with open(sys.argv[1]) as f:
-    content = f.read()
+info "Step 2/7 — Detecting Application and Launcher..."
 
-pkg_m = re.search(r'package="([^"]+)"', content)
-pkg = pkg_m.group(1) if pkg_m else ""
+python3 - "$MANIFEST" "$DECOMPILED" <<'PYEOF'
+import os
+import re
+import sys
+import xml.etree.ElementTree as ET
 
-# Find activity with MAIN + LAUNCHER intent
-pattern = r'<activity[^>]+android:name="([^"]+)"[^>]*>.*?android\.intent\.action\.MAIN.*?android\.intent\.category\.LAUNCHER'
-m = re.search(pattern, content, re.DOTALL)
-if not m:
-    # Try reversed order
-    pattern2 = r'<activity[^>]+android:name="([^"]+)"[^>]*>.*?android\.intent\.category\.LAUNCHER.*?android\.intent\.action\.MAIN'
-    m = re.search(pattern2, content, re.DOTALL)
+manifest_path = sys.argv[1]
+decompiled = sys.argv[2]
 
-if m:
-    cls = m.group(1)
-    if cls.startswith('.'):
-        cls = pkg + cls
-    print(cls)
-else:
-    print("NOT_FOUND")
+ANDROID = "{http://schemas.android.com/apk/res/android}"
+
+def fail(message):
+    print("ERROR:", message)
+    sys.exit(1)
+
+def normalize(name, package):
+    if not name:
+        return None
+    if name.startswith("."):
+        return package + name
+    if "." not in name:
+        return package + "." + name
+    return name
+
+try:
+    root = ET.parse(manifest_path).getroot()
+except Exception as e:
+    fail("Cannot parse manifest: " + str(e))
+
+package = root.get("package", "")
+application = root.find("application")
+
+if application is None:
+    fail("Application element not found")
+
+app_name = normalize(application.get(ANDROID + "name"), package)
+
+target = app_name
+mode = "APPLICATION"
+
+if not target:
+    print("No custom Application class; searching launcher Activity...")
+    mode = "ACTIVITY"
+
+    for element in list(application):
+        if element.tag not in ("activity", "activity-alias"):
+            continue
+
+        is_launcher = False
+
+        for intent in element.findall("intent-filter"):
+            actions = [
+                x.get(ANDROID + "name")
+                for x in intent.findall("action")
+            ]
+            categories = [
+                x.get(ANDROID + "name")
+                for x in intent.findall("category")
+            ]
+
+            if (
+                "android.intent.action.MAIN" in actions
+                and "android.intent.category.LAUNCHER" in categories
+            ):
+                is_launcher = True
+                break
+
+        if is_launcher:
+            if element.tag == "activity-alias":
+                name = element.get(ANDROID + "targetActivity")
+            else:
+                name = element.get(ANDROID + "name")
+
+            target = normalize(name, package)
+            break
+
+if not target:
+    fail("Cannot identify Application or launcher Activity")
+
+relative = target.replace(".", "/") + ".smali"
+
+matches = []
+
+for root_dir, dirs, files in os.walk(decompiled):
+    if relative in os.path.join(root_dir, relative):
+        candidate = os.path.join(root_dir, relative)
+        if os.path.isfile(candidate):
+            matches.append(candidate)
+
+if not matches:
+    fail("Smali class not found: " + relative)
+
+target_smali = matches[0]
+
+print("TARGET_CLASS=" + target)
+print("TARGET_MODE=" + mode)
+print("TARGET_SMALI=" + target_smali)
+
+# Save detected information for the next shell step.
+with open(os.path.join(decompiled, ".crystal_target"), "w") as f:
+    f.write(mode + "\n")
+    f.write(target_smali + "\n")
 PYEOF
-"$MANIFEST")
 
-    [[ "$LAUNCHER_ACT" == "NOT_FOUND" ]] && die "Cannot find launcher Activity in manifest"
-    SMALI_REL=$(to_smali_path "$LAUNCHER_ACT")
-    TARGET_SMALI=$(find_smali_file "$SMALI_REL") \
-        || die "Smali file not found for $LAUNCHER_ACT"
-    ok "Launcher Activity smali: $TARGET_SMALI"
-fi
+[[ -f "$DECOMPILED/.crystal_target" ]] \
+    || die "Target detection did not produce its result"
 
-# ── The actual smali injection ────────────────────────────────
-# Inject before invoke-super in onCreate()V
-# If onCreate doesn't exist, we append it.
+mapfile -t TARGET_INFO < "$DECOMPILED/.crystal_target"
 
-INJECT_SNIPPET='
-    const-string v0, "crystal_guideline"
-    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
-    invoke-static {p0}, Lcom/crystal/CrystalGuideline;->init(Landroid/content/Context;)V'
+INJECT_TARGET="${TARGET_INFO[0]}"
+TARGET_SMALI="${TARGET_INFO[1]}"
 
-python3 - "$TARGET_SMALI" "$INJECT_SNIPPET" "$INJECT_TARGET" <<'PYEOF'
-import sys, re
+[[ -f "$TARGET_SMALI" ]] || die "Target Smali file not found"
 
-smali_path = sys.argv[1]
-snippet    = sys.argv[2]
-mode       = sys.argv[3]   # APPLICATION or ACTIVITY
+ok "Injection target: $TARGET_SMALI"
 
-with open(smali_path) as f:
+# ─── Inject loadLibrary and initialize Crystal ────────────────
+
+python3 - "$TARGET_SMALI" "$INJECT_TARGET" <<'PYEOF'
+import re
+import sys
+
+path = sys.argv[1]
+mode = sys.argv[2]
+
+with open(path, encoding="utf-8") as f:
     content = f.read()
 
-# Check if .locals 0 needs bumping — our snippet uses v0
-# We'll ensure .locals is at least 1 in the onCreate method
+if mode == "APPLICATION":
+    signature = r'onCreate\(\)V'
+    params = 1
+    super_signature = "onCreate()V"
+else:
+    signature = r'onCreate\(Landroid/os/Bundle;\)V'
+    params = 2
+    super_signature = "onCreate(Landroid/os/Bundle;)V"
 
-ON_CREATE_SIG = ".method public onCreate()V" if mode == "APPLICATION" \
-    else ".method public onCreate(Landroid/os/Bundle;)V"
+method_match = re.search(
+    r'(?m)^\.method\b[^\n]*\b' + signature + r'[^\n]*$',
+    content
+)
 
-if ON_CREATE_SIG not in content:
-    # No onCreate — append one
-    print(f"[patch.py] No {ON_CREATE_SIG} found — injecting fresh method", file=sys.stderr)
+if "crystal_guideline" in content:
+    print("Crystal injection already exists; skipping duplicate injection.")
+    sys.exit(0)
+
+def get_super():
+    match = re.search(r'(?m)^\.super\s+(L[^;]+;)', content)
+    if not match:
+        raise SystemExit("ERROR: Cannot identify superclass")
+    return match.group(1)
+
+super_class = get_super()
+
+if not method_match:
+    print("Creating onCreate method...")
+
     if mode == "APPLICATION":
-        new_method = f"""
-{ON_CREATE_SIG}
+        declaration = ".method public onCreate()V"
+        super_call = (
+            f"    invoke-super {{p0}}, "
+            f"{super_class}->{super_signature}"
+        )
+    else:
+        declaration = (
+            ".method protected onCreate(Landroid/os/Bundle;)V"
+        )
+        super_call = (
+            f"    invoke-super {{p0, p1}}, "
+            f"{super_class}->{super_signature}"
+        )
+
+    new_method = f"""
+{declaration}
     .locals 1
-    invoke-super {{p0}}, Landroid/app/Application;->onCreate()V
-{snippet}
+{super_call}
+    const-string v0, "crystal_guideline"
+    invoke-static {{v0}}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
+    invoke-static {{p0}}, Lcom/crystal/CrystalGuideline;->init(Landroid/content/Context;)V
     return-void
 .end method
 """
-    else:
-        new_method = f"""
-{ON_CREATE_SIG}
-    .locals 2
-    invoke-super {{p0, p1}}, Landroid/app/Activity;->onCreate(Landroid/os/Bundle;)V
-{snippet}
-    return-void
-.end method
-"""
-    # Insert before last .end class
-    content = content.rstrip()
-    if content.endswith(".end class"):
-        content = content[: -len(".end class")].rstrip() + "\n" + new_method + "\n.end class\n"
-    else:
-        content += "\n" + new_method
+
+    end_class = re.search(r'(?m)^\.end class\s*$', content)
+
+    if not end_class:
+        raise SystemExit("ERROR: .end class not found")
+
+    content = (
+        content[:end_class.start()]
+        + new_method
+        + "\n"
+        + content[end_class.start():]
+    )
+
 else:
-    # Find the method and patch inside it
-    # First ensure .locals >= 1
-    def bump_locals(block):
-        def fix(m):
-            n = int(m.group(1))
-            return f".locals {max(n, 1)}"
-        return re.sub(r'\.locals (\d+)', fix, block, count=1)
+    start = method_match.start()
+    end_match = re.search(r'(?m)^\.end method\s*$', content[method_match.end():])
 
-    # Split out the onCreate block
-    start_idx = content.index(ON_CREATE_SIG)
-    end_idx   = content.index(".end method", start_idx) + len(".end method")
-    method_block = content[start_idx:end_idx]
+    if not end_match:
+        raise SystemExit("ERROR: onCreate method is incomplete")
 
-    # Check already patched
-    if "crystal_guideline" in method_block:
-        print("[patch.py] Already patched — skipping", file=sys.stderr)
-        sys.exit(0)
+    end = method_match.end() + end_match.end()
+    block = content[start:end]
 
-    method_block = bump_locals(method_block)
+    locals_match = re.search(r'(?m)^(\s*)\.locals\s+(\d+)', block)
+    registers_match = re.search(r'(?m)^(\s*)\.registers\s+(\d+)', block)
 
-    # Inject before first invoke-super
-    if "invoke-super" in method_block:
-        method_block = method_block.replace(
-            "invoke-super",
-            snippet.lstrip("\n") + "\n    invoke-super",
-            1
+    if locals_match:
+        old = int(locals_match.group(2))
+        register = f"v{old}"
+        block = (
+            block[:locals_match.start(2)]
+            + str(old + 1)
+            + block[locals_match.end(2):]
         )
+
+    elif registers_match:
+        old = int(registers_match.group(2))
+        local_count = old - params
+
+        if local_count < 0:
+            raise SystemExit("ERROR: Invalid register count")
+
+        register = f"v{local_count}"
+
+        block = (
+            block[:registers_match.start(2)]
+            + str(old + 1)
+            + block[registers_match.end(2):]
+        )
+
     else:
-        # No invoke-super: inject before return-void
-        method_block = method_block.replace(
-            "return-void",
-            snippet.lstrip("\n") + "\n    return-void",
-            1
-        )
+        raise SystemExit("ERROR: No .locals or .registers declaration")
 
-    content = content[:start_idx] + method_block + content[end_idx:]
+    injection = f"""
+    const-string {register}, "crystal_guideline"
+    invoke-static {{{register}}}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
+    invoke-static {{p0}}, Lcom/crystal/CrystalGuideline;->init(Landroid/content/Context;)V
+"""
 
-with open(smali_path, "w") as f:
+    super_match = re.search(r'(?m)^.*invoke-super.*$', block)
+
+    if super_match:
+        position = super_match.end()
+        block = block[:position] + "\n" + injection + block[position:]
+    else:
+        return_match = re.search(r'(?m)^.*return-void\s*$', block)
+
+        if not return_match:
+            raise SystemExit("ERROR: No suitable injection point")
+
+        position = return_match.start()
+        block = block[:position] + injection + block[position:]
+
+    content = content[:start] + block + content[end:]
+
+with open(path, "w", encoding="utf-8") as f:
     f.write(content)
 
-print("[patch.py] Injection successful", file=sys.stderr)
+print("Crystal injection successful.")
 PYEOF
 
 ok "Smali injection complete"
 
 # ═══════════════════════════════════════════════════════════════
-# STEP 3: COPY OUR SMALI FILES INTO DECOMPILED APK
+# STEP 3 — COPY CRYSTAL SMALI
 # ═══════════════════════════════════════════════════════════════
-info "Step 3/7 — Injecting com/crystal/ smali files…"
 
-# Use the LAST smali_classes* dir (avoids conflict with game's own DEX)
-LAST_SMALI_DIR=$(ls -d "$DECOMPILED"/smali*/ 2>/dev/null | sort | tail -1)
-[[ -z "$LAST_SMALI_DIR" ]] && LAST_SMALI_DIR="$DECOMPILED/smali/"
+info "Step 3/7 — Copying Crystal Smali files..."
+
+LAST_SMALI_DIR=$(
+    find "$DECOMPILED" -maxdepth 1 -type d -name 'smali*' \
+        | sort -V | tail -n 1
+)
+
+[[ -n "$LAST_SMALI_DIR" ]] \
+    || die "No Smali directory found"
 
 mkdir -p "$LAST_SMALI_DIR/com/crystal"
-cp -r "$SMALI_SRC/crystal/"* "$LAST_SMALI_DIR/com/crystal/"
-ok "Copied smali: CrystalGuideline, GuidelineService, ShowGuidelineRunnable → $LAST_SMALI_DIR/com/crystal/"
+
+cp -a "$SMALI_SRC/." "$LAST_SMALI_DIR/com/crystal/"
+
+ok "Crystal Smali files copied"
 
 # ═══════════════════════════════════════════════════════════════
-# STEP 4: COPY .SO INTO APK LIB FOLDER
+# STEP 4 — COPY NATIVE LIBRARY
 # ═══════════════════════════════════════════════════════════════
-info "Step 4/7 — Placing libcrystal_guideline.so…"
+
+info "Step 4/7 — Installing ARM64 native library..."
+
 mkdir -p "$DECOMPILED/lib/arm64-v8a"
-cp "$SO_SRC" "$DECOMPILED/lib/arm64-v8a/libcrystal_guideline.so"
-ok "Copied .so → lib/arm64-v8a/"
+
+cp "$SO_SRC" \
+    "$DECOMPILED/lib/arm64-v8a/libcrystal_guideline.so"
+
+ok "Native library copied"
 
 # ═══════════════════════════════════════════════════════════════
-# STEP 5: PATCH AndroidManifest.xml
-# Add SYSTEM_ALERT_WINDOW permission + register GuidelineService
+# STEP 5 — PATCH MANIFEST
 # ═══════════════════════════════════════════════════════════════
-info "Step 5/7 — Patching AndroidManifest.xml…"
+
+info "Step 5/7 — Updating AndroidManifest.xml..."
 
 python3 - "$MANIFEST" <<'PYEOF'
-import sys, re
+import re
+import sys
 
 path = sys.argv[1]
-with open(path) as f:
+
+with open(path, encoding="utf-8") as f:
     content = f.read()
 
-# ── SYSTEM_ALERT_WINDOW permission ───────────────────────────
-PERM = '    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>'
-if "SYSTEM_ALERT_WINDOW" not in content:
-    # Insert after <manifest ...> or first existing <uses-permission>
-    insert_after = re.search(r'<manifest[^>]+>', content)
-    if insert_after:
-        pos = insert_after.end()
-        content = content[:pos] + "\n" + PERM + content[pos:]
-    print("[manifest] Added SYSTEM_ALERT_WINDOW permission", file=sys.stderr)
-else:
-    print("[manifest] SYSTEM_ALERT_WINDOW already present", file=sys.stderr)
+def add_permission(name):
+    global content
 
-# ── FOREGROUND_SERVICE permission (API 28+) ──────────────────
-FG_PERM = '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>'
-if "FOREGROUND_SERVICE" not in content:
-    insert_after = re.search(r'<manifest[^>]+>', content)
-    if insert_after:
-        pos = insert_after.end()
-        content = content[:pos] + "\n" + FG_PERM + content[pos:]
+    pattern = (
+        r'<uses-permission\b[^>]*android:name\s*=\s*["\']'
+        + re.escape(name)
+        + r'["\'][^>]*/?>'
+    )
 
-# ── Register GuidelineService inside <application> ─────────────────
-SERVICE_TAG = '''        <service
-            android:name="com.crystal.GuidelineService"
-            android:enabled="true"
-            android:exported="false"
-            android:stopWithTask="true"/>'''
+    if re.search(pattern, content):
+        print("Permission already exists:", name)
+        return
+
+    root = re.search(r'<manifest\b[^>]*>', content)
+
+    if not root:
+        raise SystemExit("ERROR: Manifest root not found")
+
+    content = (
+        content[:root.end()]
+        + '\n    <uses-permission android:name="' + name + '"/>'
+        + content[root.end():]
+    )
+
+    print("Added permission:", name)
+
+add_permission("android.permission.SYSTEM_ALERT_WINDOW")
+add_permission("android.permission.FOREGROUND_SERVICE")
+
+service = '''    <service
+        android:name="com.crystal.GuidelineService"
+        android:enabled="true"
+        android:exported="false"
+        android:stopWithTask="true"/>'''
 
 if "com.crystal.GuidelineService" not in content:
-    # Insert before </application>
-    content = content.replace("</application>", SERVICE_TAG + "\n    </application>", 1)
-    print("[manifest] Registered GuidelineService", file=sys.stderr)
-else:
-    print("[manifest] GuidelineService already registered", file=sys.stderr)
+    closing = re.search(r'</application\s*>', content)
 
-with open(path, "w") as f:
+    if not closing:
+        raise SystemExit("ERROR: Application closing tag not found")
+
+    content = (
+        content[:closing.start()]
+        + service + "\n"
+        + content[closing.start():]
+    )
+
+    print("GuidelineService registered")
+else:
+    print("GuidelineService already registered")
+
+with open(path, "w", encoding="utf-8") as f:
     f.write(content)
-print("[manifest] Done", file=sys.stderr)
+
+print("Manifest update complete")
 PYEOF
 
 ok "Manifest patched"
 
 # ═══════════════════════════════════════════════════════════════
-# STEP 6: RECOMPILE
+# STEP 6 — REBUILD AND ALIGN
 # ═══════════════════════════════════════════════════════════════
-info "Step 6/7 — Recompiling with apktool…"
-apktool b "$DECOMPILED" -o "$APK_UNSIGNED" \
-    || die "apktool build failed — check smali syntax above"
-ok "Recompiled → $APK_UNSIGNED"
 
-# ─── zipalign ─────────────────────────────────────────────────
-info "       zipalign…"
-zipalign -v 4 "$APK_UNSIGNED" "$APK_ALIGNED" >/dev/null \
-    || die "zipalign failed"
-ok "Aligned"
+info "Step 6/7 — Rebuilding APK..."
+
+apktool b "$DECOMPILED" -o "$APK_UNSIGNED"
+
+[[ -s "$APK_UNSIGNED" ]] || die "Rebuilt APK is missing or empty"
+
+ok "APK rebuilt"
+
+info "Running zipalign..."
+
+zipalign -f -v 4 "$APK_UNSIGNED" "$APK_ALIGNED"
+
+zipalign -c -v 4 "$APK_ALIGNED"
+
+ok "APK aligned"
 
 # ═══════════════════════════════════════════════════════════════
-# STEP 7: SIGN
+# STEP 7 — SIGN
 # ═══════════════════════════════════════════════════════════════
-info "Step 7/7 — Signing APK…"
 
-# Generate keystore if not already present
+info "Step 7/7 — Signing APK..."
+
 if [[ ! -f "$KEYSTORE" ]]; then
-    warn "No keystore found — generating debug keystore (crystal.jks)…"
+    warn "Generating signing keystore..."
+
     mkdir -p "$(dirname "$KEYSTORE")"
-    keytool -genkey -v \
+
+    keytool -genkeypair -v \
         -keystore "$KEYSTORE" \
         -alias crystal \
         -keyalg RSA \
         -keysize 2048 \
         -validity 10000 \
         -storepass crystal2024 \
-        -keypass   crystal2024 \
-        -dname "CN=Crystal, OU=Mod, O=Crystal, L=ID, S=ID, C=ID" \
-        2>/dev/null \
-        || die "keytool failed — is java installed?"
-    ok "Keystore generated: $KEYSTORE"
+        -keypass crystal2024 \
+        -dname "CN=Crystal, OU=Mod, O=Crystal, L=ID, S=ID, C=ID"
 fi
 
 apksigner sign \
-    --ks         "$KEYSTORE" \
-    --ks-pass    pass:crystal2024 \
-    --key-pass   pass:crystal2024 \
+    --ks "$KEYSTORE" \
+    --ks-pass pass:crystal2024 \
+    --key-pass pass:crystal2024 \
     --ks-key-alias crystal \
-    --out        "$APK_OUT" \
-    "$APK_ALIGNED" \
-    || die "apksigner failed"
+    --out "$APK_OUT" \
+    "$APK_ALIGNED"
 
-ok "Signed APK → $APK_OUT"
+[[ -s "$APK_OUT" ]] || die "Signed APK was not created"
 
-# ─── final summary ────────────────────────────────────────────
+apksigner verify --verbose "$APK_OUT"
+
+ok "APK signed and verified"
+
+# ═══════════════════════════════════════════════════════════════
+# FINAL RESULT
+# ═══════════════════════════════════════════════════════════════
+
 SIZE=$(du -sh "$APK_OUT" | cut -f1)
+
 echo ""
-echo -e "${GRN}══════════════════════════════════════════════${RST}"
-echo -e "${GRN}  Crystal Guideline v1.0 — Build Complete!    ${RST}"
-echo -e "${GRN}  Output: ${CYN}$APK_OUT${RST}"
-echo -e "${GRN}  Size:   ${CYN}$SIZE${RST}"
-echo -e "${GRN}══════════════════════════════════════════════${RST}"
-echo ""
-echo -e "Install:  ${YLW}adb install -r \"$APK_OUT\"${RST}"
-echo -e "Or copy the APK to your device and install via file manager."
-echo ""
-echo -e "${YLW}⚠  On Android 6.0+: grant 'Draw over other apps'${RST}"
-echo -e "${YLW}   Settings → Apps → [Game] → Display over other apps → ON${RST}"
+echo -e "${GRN}============================================${RST}"
+echo -e "${GRN}       CRYSTAL GUIDELINE BUILD COMPLETE     ${RST}"
+echo -e "${GRN}============================================${RST}"
+echo -e "Output: ${CYN}$APK_OUT${RST}"
+echo -e "Size:   ${CYN}$SIZE${RST}"
 echo ""
