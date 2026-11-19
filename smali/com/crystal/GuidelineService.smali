@@ -1,8 +1,3 @@
-# ═══════════════════════════════════════════════════════════════
-# com/crystal/GuidelineService.smali
-# Foreground Service that manages the GuidelineView overlay.
-# Delayed creation (5 s) gives the game time to load its table.
-# ═══════════════════════════════════════════════════════════════
 
 .class public Lcom/crystal/GuidelineService;
 .super Landroid/app/Service;
@@ -11,103 +6,132 @@
 .field private view:Lcom/crystal/GuidelineView;
 .field private wm:Landroid/view/WindowManager;
 
-# ── onCreate ─────────────────────────────────────────────────
+# onCreate
 .method public onCreate()V
     .locals 4
 
     invoke-super {p0}, Landroid/app/Service;->onCreate()V
 
-    # Build Handler on main Looper
+    # Create Handler on main Looper
     new-instance v0, Landroid/os/Handler;
+
     invoke-static {}, Landroid/os/Looper;->getMainLooper()Landroid/os/Looper;
     move-result-object v1
+
     invoke-direct {v0, v1}, Landroid/os/Handler;-><init>(Landroid/os/Looper;)V
+
     iput-object v0, p0, Lcom/crystal/GuidelineService;->handler:Landroid/os/Handler;
 
-    # Grab WindowManager early (valid from Service context)
+    # Get WindowManager
     const-string v1, "window"
+
     invoke-virtual {p0, v1}, Landroid/content/Context;->getSystemService(Ljava/lang/String;)Ljava/lang/Object;
     move-result-object v1
+
     iput-object v1, p0, Lcom/crystal/GuidelineService;->wm:Landroid/view/WindowManager;
 
     return-void
 .end method
 
-# ── onStartCommand: post delayed overlay creation ────────────
+# onStartCommand
 .method public onStartCommand(Landroid/content/Intent;II)I
     .locals 4
 
     iget-object v0, p0, Lcom/crystal/GuidelineService;->handler:Landroid/os/Handler;
 
-    # ShowGuidelineRunnable(service)
+    if-eqz v0, :handler_missing
+
+    # Create ShowGuidelineRunnable
     new-instance v1, Lcom/crystal/ShowGuidelineRunnable;
+
     invoke-direct {v1, p0}, Lcom/crystal/ShowGuidelineRunnable;-><init>(Lcom/crystal/GuidelineService;)V
 
-    const-wide v2, 5000L   # 5 second delay
+    # Delay = 5000 milliseconds
+    const-wide/16 v2, 0x1388
 
     invoke-virtual {v0, v1, v2, v3}, Landroid/os/Handler;->postDelayed(Ljava/lang/Runnable;J)Z
 
-    const/4 v0, 0x1        # START_STICKY
+    :handler_missing
+    const/4 v0, 0x1
+
     return v0
 .end method
 
-# ── createOverlay: called by ShowGuidelineRunnable (main thread) ──
+# createOverlay
 .method public createOverlay()V
     .locals 8
 
-    # GuidelineView view = new GuidelineView(this)
+    # Create GuidelineView
     new-instance v0, Lcom/crystal/GuidelineView;
+
     invoke-direct {v0, p0}, Lcom/crystal/GuidelineView;-><init>(Landroid/content/Context;)V
+
     iput-object v0, p0, Lcom/crystal/GuidelineService;->view:Lcom/crystal/GuidelineView;
 
-    # View must be hardware-accelerated for smooth redraws
-    const/high16 v1, 0x100  # View.LAYER_TYPE_HARDWARE = 2
+    # Enable hardware layer
+    const/4 v1, 0x2
     const/4 v2, 0x0
+
     invoke-virtual {v0, v1, v2}, Landroid/view/View;->setLayerType(ILandroid/graphics/Paint;)V
 
-    # WindowManager.LayoutParams
+    # Create WindowManager.LayoutParams
     new-instance v1, Landroid/view/WindowManager$LayoutParams;
 
-    const/16 v2, 0x7F6     # TYPE_APPLICATION_OVERLAY = 2038 = 0x7F6
-    const/4  v3, -1        # MATCH_PARENT width
-    const/4  v4, -1        # MATCH_PARENT height
-    # FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL | FLAG_LAYOUT_IN_SCREEN
+    const/16 v2, 0x7F6
+    const/4 v3, -0x1
+    const/4 v4, -0x1
     const/16 v5, 0x228
-    const/16 v6, -3        # PixelFormat.TRANSLUCENT
+    const/4 v6, -0x3
 
-    invoke-direct {v1, v2, v3, v4, v5, v6}, Landroid/view/WindowManager$LayoutParams;-><init>(IIIII)V
+    invoke-direct/range {v1 .. v6}, Landroid/view/WindowManager$LayoutParams;-><init>(IIIII)V
 
-    # addView
+    # Add overlay
     iget-object v2, p0, Lcom/crystal/GuidelineService;->wm:Landroid/view/WindowManager;
+
+    if-eqz v2, :overlay_done
+
     invoke-interface {v2, v0, v1}, Landroid/view/WindowManager;->addView(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V
 
+    :overlay_done
     return-void
 .end method
 
-# ── onBind (required stub) ───────────────────────────────────
+# onBind
 .method public onBind(Landroid/content/Intent;)Landroid/os/IBinder;
     .locals 1
+
     const/4 v0, 0x0
+
     return-object v0
 .end method
 
-# ── onDestroy ────────────────────────────────────────────────
+# onDestroy
 .method public onDestroy()V
     .locals 2
 
+    # Remove overlay if it exists
     iget-object v0, p0, Lcom/crystal/GuidelineService;->wm:Landroid/view/WindowManager;
+
     iget-object v1, p0, Lcom/crystal/GuidelineService;->view:Lcom/crystal/GuidelineView;
 
-    if-eqz v0, :skip
-    if-eqz v1, :skip
+    if-eqz v0, :remove_callbacks
+
+    if-eqz v1, :remove_callbacks
+
     invoke-interface {v0, v1}, Landroid/view/WindowManager;->removeView(Landroid/view/View;)V
 
-    :skip
+    :remove_callbacks
+    # Remove pending Handler callbacks
     iget-object v0, p0, Lcom/crystal/GuidelineService;->handler:Landroid/os/Handler;
-    if-eqz v0, :done
-    invoke-virtual {v0}, Landroid/os/Handler;->removeCallbacksAndMessages(Ljava/lang/Object;)V
 
-    :done
+    if-eqz v0, :destroy_service
+
+    const/4 v1, 0x0
+
+    invoke-virtual {v0, v1}, Landroid/os/Handler;->removeCallbacksAndMessages(Ljava/lang/Object;)V
+
+    :destroy_service
     invoke-super {p0}, Landroid/app/Service;->onDestroy()V
+
     return-void
 .end method
