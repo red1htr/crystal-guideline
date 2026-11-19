@@ -99,7 +99,12 @@ jobs:
 
       - name: Download base APK
         run: |
-          wget -q "${{ github.event.inputs.apk_url }}" -O base.apk
+          curl -fL --show-error \
+            --retry 3 \
+            --user-agent "Mozilla/5.0" \
+            "${{ github.event.inputs.apk_url }}" \
+            -o base.apk
+
           ls -lh base.apk
           file base.apk | grep -q "Zip archive" \
             || (echo "Download failed or not a valid APK" && exit 1)
