@@ -86,10 +86,8 @@ mkdir -p "$WORK_DIR" "$DIST_DIR"
 
 info "Step 1/7 — Decompiling APK..."
 
-if ! apktool d "$APK_IN" -o "$DECOMPILED" ; then
-    warn "First decompile attempt failed; retrying normally..."
-    rm -rf "$DECOMPILED"
-    apktool d "$APK_IN" -o "$DECOMPILED"
+if ! apktool d "$APK_IN" -o "$DECOMPILED"; then
+    die "APK decompilation failed"
 fi
 
 [[ -f "$MANIFEST" ]] || die "AndroidManifest.xml not found"
