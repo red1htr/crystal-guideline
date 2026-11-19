@@ -1,3 +1,4 @@
+
 name: Crystal Guideline — Android Build
 
 on:
@@ -32,7 +33,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Android NDK via sdkmanager (fastest path on ubuntu-latest)
       - name: Set up Android SDK + NDK
         uses: android-actions/setup-android@v4
 
@@ -63,7 +63,6 @@ jobs:
           SO=".build/libcrystal_guideline.so"
           ls -lh "$SO"
           file "$SO"
-          # Confirm it's ARM64 ELF shared object
           file "$SO" | grep -q "ARM aarch64" \
             || (echo "ERROR: not an ARM64 shared lib" && exit 1)
 
@@ -74,7 +73,7 @@ jobs:
           path: .build/libcrystal_guideline.so
           retention-days: 30
 
-  # ─── Job 2: Full APK patch (only when apk_url provided) ─────
+  # ─── Job 2: Full APK patch ─────────────────
   patch-apk:
     name: Patch APK (optional)
     runs-on: ubuntu-latest
@@ -90,7 +89,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq openjdk-17-jdk zipalign apksigner python3
 
-          # Install apktool latest
           wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar \
                -O /usr/local/bin/apktool.jar
           wget -q https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool \
@@ -106,8 +104,22 @@ jobs:
             -o base.apk
 
           ls -lh base.apk
-          file base.apk | grep -q "Zip archive" \
-            || (echo "Download failed or not a valid APK" && exit 1)
+
+          python3 - <<'PY'
+          import zipfile
+          import sys
+
+          if not zipfile.is_zipfile("base.apk"):
+              print("ERROR: The downloaded file is not a valid APK/ZIP")
+              sys.exit(1)
+
+          with zipfile.ZipFile("base.apk") as apk:
+              if "AndroidManifest.xml" not in apk.namelist():
+                  print("ERROR: AndroidManifest.xml is missing")
+                  sys.exit(1)
+
+              print("APK validation successful!")
+          PY
 
       - name: Download compiled .so
         uses: actions/download-artifact@v4
@@ -127,7 +139,7 @@ jobs:
           path: dist/crystal_patched_signed.apk
           retention-days: 14
 
-  # ─── Job 3: Release (on version tag) ─────────────────────────
+  # ─── Job 3: Release ─────────────────
   release:
     name: Create Release
     runs-on: ubuntu-latest
@@ -147,17 +159,17 @@ jobs:
           name: "Crystal Guideline ${{ github.ref_name }}"
           body: |
             ## Crystal Guideline ${{ github.ref_name }}
-            
+
             ### Files
             - `libcrystal_guideline.so` — ARM64 native library (inject via patch.sh)
-            
+
             ### Usage
             ```bash
             # 1. Download this .so to dist/
             # 2. Run patch.sh with your 8BP APK:
             ./patch.sh 8ballpool.apk
             ```
-            
+
             ### Modes
             - **Ghost Ball** — shows ghost ball + tangent predictor
             - **Line Extender** — extends shot line with wall bounces (up to 3)
